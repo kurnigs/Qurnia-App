@@ -284,7 +284,11 @@ export default function App() {
 
                // Automatically trigger correct mode strictly passing config override
                if (data.config.selectedMode === 'tryout') {
-                 generateTryOut(data.config);
+                 // INTERCEPT: Load the pre-generated test directly from Firebase
+                 setTryOutQuestions(data.config.generatedQuestions || []);
+                 setTimeLeft(data.config.tryOutDuration * 60);
+                 setCurrentTryOutIndex(0);
+                 setCurrentView('tryout');
                } else {
                  generateQuestion(data.config);
                }
@@ -998,20 +1002,46 @@ export default function App() {
 
   const handleStartSession = async () => {
     if (appMode === 'monitor' && role === 'host') {
+      let preGeneratedQuestions = [];
+      
+      // SYNTHESIZE EXAM ONCE AS HOST TO SAVE API QUOTA
+      if (selectedMode === 'tryout') {
+        const targetLanguageName = TRANSLATIONS[qLanguage].langName;
+        const typesList = qTypes.join(", "); 
+        const topicStr = (isRandomTopic && analysisResult?.topics?.length > 0) ? "Randomly mix: " + analysisResult.topics.join(', ') : (customTopics.length > 0 ? customTopics.join(', ') : "General Knowledge");
+        const diffStr = qDifficulty === 'random' ? "Random" : qDifficulty;
+        const contextStr = analysisResult ? `Context: ${analysisResult.topics} Details: ${analysisResult.importantDetails}` : "General";
+
+        const promptText = `
+          You are an advanced academic AI assistant. Generate an exam consisting of EXACTLY ${tryOutQCount} unique practice questions.
+          Context: ${contextStr}
+          Constraints: Language MUST be exactly ${targetLanguageName}. Focus: ${topicStr}. Difficulty: ${diffStr}. Allowed Types: ${typesList}. Special Request: ${specialRequest || "None"}.
+          CRITICAL LATEX GUIDELINES: Format ALL math using LaTeX in DOLLAR SIGNS: $...$ or $$...$$.
+          Respond ONLY with a valid JSON ARRAY of objects: [{"questionText": "...", "type": "...", "topic": "...", "difficulty": "...", "options": ["..."], "correctAnswer": "...", "explanation": "..."}]
+        `;
+
+        const payload = {
+          contents: [{ role: "user", parts: [{ text: promptText }] }],
+          generationConfig: { temperature: 0.8, responseMimeType: "application/json" }
+        };
+
+        // If testing locally use import.meta.env.VITE_GEMINI_API_KEY. If hardcoded, insert it here.
+        const apiKey = import.meta.env.VITE_GEMINI_API_KEY; 
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key=${apiKey}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+        });
+        
+        const result = await response.json();
+        preGeneratedQuestions = JSON.parse(result.candidates[0].content.parts[0].text);
+      }
+
       const roomRef = doc(db, 'rooms', roomCode);
       await updateDoc(roomRef, {
         status: 'in-progress',
         config: {
-          analysisResult,
-          customTopics,
-          isRandomTopic,
-          qLanguage,
-          qDifficulty,
-          qTypes,
-          specialRequest,
-          selectedMode,
-          tryOutQCount,
-          tryOutDuration
+          analysisResult, customTopics, isRandomTopic, qLanguage, qDifficulty,
+          qTypes, specialRequest, selectedMode, tryOutQCount, tryOutDuration,
+          generatedQuestions: preGeneratedQuestions // Broadcast to all students
         }
       });
       setCurrentView('teacher_dashboard');
@@ -1026,29 +1056,7 @@ export default function App() {
     let localCorrect = 0;
     let localTotal = 0;
     
-    tryOutQuestions.forEach((q, idx) => {
-      // We skip essays in the local objective calculator (AI will handle them in 4B)
-      if (q.type === 'essay') return; 
-      
-      localTotal++; // 1 potential point
-      let isCorrect = false;
-      const uA = userTryOutAnswers[idx] || '';
-      const cA = q.correctAnswer || '';
-      
-      if (q.type === 'mcqComplex') {
-        const uLetters = uA.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean).sort().join(',');
-        const cLetters = cA.split(',').map(s=>s.trim().charAt(0).toUpperCase()).filter(Boolean).sort().join(',');
-        isCorrect = (uLetters === cLetters);
-      } else if (q.type.startsWith('mcq')) {
-        const uLetter = uA.trim().toUpperCase();
-        const cLetter = cA.trim().charAt(0).toUpperCase();
-        isCorrect = (uLetter === cLetter);
-      } else {
-        isCorrect = (uA.trim().toLowerCase() === cA.trim().toLowerCase());
-      }
-      
-      if (isCorrect) localCorrect++; // 1 point for correct, 0 for wrong
-    });
+    // ... [KEEP YOUR EXISTING LOCAL GRADING FOR LOOP HERE] ...
 
     setObjectiveScore({ correct: localCorrect, total: localTotal });
     setCurrentView('tryout_summary');
@@ -1063,9 +1071,20 @@ export default function App() {
       }).catch(console.error);
     }
 
-    evaluateTryOutSession(localCorrect, localTotal); // Fire the AI payload
+    // BYPASS AI EVALUATION FOR LIVE STUDENTS TO SAVE 20 RPD QUOTA
+    if (role === 'student') {
+      setIsEvaluatingTryOut(false);
+      setTryOutFeedback({
+        motivation: "Submission logged successfully. Excellent effort!",
+        critique: "Your objective score has been synced to the teacher's live leaderboard.",
+        advice: "Review the correct answers and step-by-step explanations in the post-mortem log below.",
+        essayScores: {}
+      });
+    } else {
+      evaluateTryOutSession(localCorrect, localTotal); // Fire AI only for Solo mode
+    }
   }, [tryOutQuestions, userTryOutAnswers, qLanguage, cheatViolationsCount, role, roomCode, currentUserUid, db]);
-
+  
   // Safe listener to force-submit when Room Status goes to 'completed'
   useEffect(() => {
     if (roomStatus === 'completed' && role === 'student') {
